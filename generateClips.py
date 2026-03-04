@@ -15,6 +15,10 @@ import google.genai as genai
 from google.genai import types
 from collections import deque
 import shutil
+import mediapipe as mp
+from mediapipe.framework.formats import landmark_pb2
+from datetime import datetime
+from collections import defaultdict
 try:
     from scipy.io import wavfile
     from scipy.signal import find_peaks
@@ -34,6 +38,156 @@ def log(msg):
                 lf.write(msg + "\n")
         except Exception:
             pass
+
+# ------------ Continuous Learning System ------------
+
+class ContinuousLearningSystem:
+    """
+    Sistema que aprende com cada processamento e melhora continuamente
+    """
+    
+    def __init__(self, knowledge_base_path="knowledge_base"):
+        self.knowledge_base_path = knowledge_base_path
+        os.makedirs(knowledge_base_path, exist_ok=True)
+        self.correcoes_file = os.path.join(knowledge_base_path, "correcoes.json")
+        self.padroes_file = os.path.join(knowledge_base_path, "padroes_historia.json")
+        self.falantes_file = os.path.join(knowledge_base_path, "falantes.json")
+        self.metricas_file = os.path.join(knowledge_base_path, "metricas.json")
+        
+        self.correcoes = self._carregar_json(self.correcoes_file, {})
+        self.padroes = self._carregar_json(self.padroes_file, {
+            "inicio_historia": {},
+            "meio_historia": {},
+            "fim_historia": {}
+        })
+        self.falantes = self._carregar_json(self.falantes_file, {
+            "tempo_fala": {},
+            "confianca": {}
+        })
+        self.metricas = self._carregar_json(self.metricas_file, {
+            "clipes_gerados": 0,
+            "historias_completas": 0,
+            "cortes_precisos": 0,
+            "erros_tracker": 0
+        })
+    
+    def _carregar_json(self, arquivo, padrao):
+        """Carrega arquivo JSON ou retorna valor padrão"""
+        if os.path.exists(arquivo):
+            try:
+                with open(arquivo, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                return padrao
+        return padrao
+    
+    def _salvar_json(self, arquivo, dados):
+        """Salva dados em arquivo JSON"""
+        with open(arquivo, 'w', encoding='utf-8') as f:
+            json.dump(dados, f, indent=2, ensure_ascii=False)
+    
+    def aprender_com_correcao(self, texto_original, texto_corrigido, contexto=""):
+        """
+        Aprende com correções manuais de transcrição
+        """
+        palavras_originais = texto_original.lower().split()
+        palavras_corrigidas = texto_corrigido.lower().split()
+        
+        for i, (orig, corr) in enumerate(zip(palavras_originais, palavras_corrigidas)):
+            if orig != corr and len(orig) > 2:
+                if orig not in self.correcoes:
+                    self.correcoes[orig] = {
+                        "correcao": corr,
+                        "frequencia": 0,
+                        "contextos": []
+                    }
+                
+                entry = self.correcoes[orig]
+                entry["frequencia"] += 1
+                entry["contextos"].append({
+                    "texto": contexto[:100],
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+                # Manter só últimos 10 contextos
+                if len(entry["contextos"]) > 10:
+                    entry["contextos"] = entry["contextos"][-10:]
+        
+        self._salvar_json(self.correcoes_file, self.correcoes)
+        log(f"[learn] Aprendida correção: '{texto_original}' -> '{texto_corrigido}'")
+    
+    def aprender_padrao_historia(self, texto, tipo, acertou):
+        """
+        Aprende padrões de início/meio/fim de história
+        tipo: 'inicio', 'meio', 'fim'
+        """
+        if tipo not in self.padroes:
+            return
+        
+        palavras = texto.lower().split()
+        for palavra in palavras[:5]:  # Só primeiras palavras são relevantes
+            if len(palavra) < 3:
+                continue
+                
+            if palavra not in self.padroes[tipo]:
+                self.padroes[tipo][palavra] = {"acertos": 0, "erros": 0}
+            
+            if acertou:
+                self.padroes[tipo][palavra]["acertos"] += 1
+            else:
+                self.padroes[tipo][palavra]["erros"] += 1
+        
+        self._salvar_json(self.padroes_file, self.padroes)
+    
+    def recomendar_palavras_chave(self, tipo, threshold=0.7, min_amostras=3):
+        """
+        Recomenda palavras com alta probabilidade de indicar início/meio/fim
+        """
+        if tipo not in self.padroes:
+            return []
+        
+        recomendacoes = []
+        for palavra, stats in self.padroes[tipo].items():
+            total = stats["acertos"] + stats["erros"]
+            if total >= min_amostras:
+                precisao = stats["acertos"] / total
+                if precisao >= threshold:
+                    recomendacoes.append((palavra, precisao))
+        
+        return sorted(recomendacoes, key=lambda x: x[1], reverse=True)
+    
+    def registrar_erro_tracker(self):
+        """Registra erro do tracker para aprender quando reinicializar"""
+        self.metricas["erros_tracker"] += 1
+        self._salvar_json(self.metricas_file, self.metricas)
+    
+    def registrar_clipe_gerado(self, historia_completa=False):
+        """Registra métricas de clipes gerados"""
+        self.metricas["clipes_gerados"] += 1
+        if historia_completa:
+            self.metricas["historias_completas"] += 1
+        self._salvar_json(self.metricas_file, self.metricas)
+    
+    def get_correcoes_aprendidas(self):
+        """Retorna dicionário de correções com alta frequência"""
+        correcoes_finais = {}
+        for erro, dados in self.correcoes.items():
+            if dados["frequencia"] >= 2:  # Só usar se apareceu pelo menos 2 vezes
+                correcoes_finais[erro] = dados["correcao"]
+        return correcoes_finais
+
+
+# ------------ MediaPipe FaceMesh ------------
+
+# Inicializar MediaPipe FaceMesh
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=2,  # No máximo 2 pessoas (seu estúdio)
+    refine_landmarks=True,  # Melhor precisão nos lábios
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 # ------------ helper utilities ------------
 
@@ -75,18 +229,376 @@ def transcribe_audio(audio_path, whisper_model_size="base"):
     return segments
 
 
-def review_transcription(transcription_segments):
+def calcular_movimento_labial(landmarks, frame_largura, frame_altura):
+    """
+    Calcula a abertura dos lábios baseado nos landmarks faciais.
+    Quanto maior o valor, mais aberto está a boca (falando).
+    Usa landmarks específicos dos lábios do MediaPipe.
+    """
+    # Índices dos landmarks dos lábios no MediaPipe
+    # Lábio superior: 13 (canto esquerdo), 14 (centro superior)
+    # Lábio inferior: 15 (centro inferior), 16 (canto direito)
+    LABIO_SUPERIOR = [13, 14]
+    LABIO_INFERIOR = [15, 16]
+    
+    # Calcular pontos dos lábios
+    pontos_superior = []
+    pontos_inferior = []
+    
+    for idx in LABIO_SUPERIOR:
+        ponto = landmarks.landmark[idx]
+        x = int(ponto.x * frame_largura)
+        y = int(ponto.y * frame_altura)
+        pontos_superior.append((x, y))
+    
+    for idx in LABIO_INFERIOR:
+        ponto = landmarks.landmark[idx]
+        x = int(ponto.x * frame_largura)
+        y = int(ponto.y * frame_altura)
+        pontos_inferior.append((x, y))
+    
+    # Calcular distância média entre lábios
+    distancias = []
+    for p_sup in pontos_superior:
+        for p_inf in pontos_inferior:
+            dist = np.sqrt((p_sup[0] - p_inf[0])**2 + (p_sup[1] - p_inf[1])**2)
+            distancias.append(dist)
+    
+    return np.mean(distancias) if distancias else 0
+
+
+def detectar_quem_esta_falando(rostos_com_landmarks, frame_atual, historico_movimento, frame_largura, frame_altura):
+    """
+    Detecta qual pessoa está falando baseado no movimento dos lábios.
+    Retorna o índice do rosto que está falando (None se ninguém).
+    """
+    if not rostos_com_landmarks:
+        return None
+    
+    movimentos = []
+    for i, (bbox, landmarks) in enumerate(rostos_com_landmarks):
+        movimento = calcular_movimento_labial(landmarks, frame_largura, frame_altura)
+        movimentos.append((i, movimento))
+        
+        # Atualizar histórico
+        if i not in historico_movimento:
+            historico_movimento[i] = deque(maxlen=10)
+        historico_movimento[i].append(movimento)
+    
+    # Calcular média do histórico para suavizar
+    movimentos_suavizados = []
+    for i, _ in movimentos:
+        media = np.mean(historico_movimento[i]) if historico_movimento[i] else 0
+        movimentos_suavizados.append((i, media))
+    
+    # Quem tem maior movimento médio é o falante
+    if movimentos_suavizados:
+        falante = max(movimentos_suavizados, key=lambda x: x[1])
+        # Só considerar se movimento for significativo
+        if falante[1] > 5:  # Threshold mínimo
+            return falante[0]
+    
+    return None
+
+
+def corrigir_transcricao_com_aprendizado(texto: str, learning_system: ContinuousLearningSystem) -> str:
+    """
+    Corrige erros de transcrição usando correções aprendidas.
+    """
+    texto_corrigido = texto
+    correcoes = learning_system.get_correcoes_aprendidas()
+    
+    for erro, correcao in correcoes.items():
+        texto_corrigido = re.sub(r'\b' + re.escape(erro) + r'\b', correcao, texto_corrigido, flags=re.IGNORECASE)
+    
+    return texto_corrigido
+
+
+def detectar_estrutura_historia(texto: str, texto_anterior: str = None, learning_system: ContinuousLearningSystem = None) -> Dict[str, bool]:
+    """
+    Detecta se o texto é início, meio ou fim de história usando NLP.
+    Retorna dicionário com flags.
+    """
+    resultado = {
+        "inicio": False,
+        "meio": False,
+        "fim": False
+    }
+    
+    texto_lower = texto.lower()
+    
+    # Padrões fixos (base)
+    padroes_inicio = [
+        r'deixa eu te contar', r'vou te falar', r'sabe o que aconteceu',
+        r'descobri', r'aconteceu uma coisa', r'teve uma vez', r'um dia',
+        r'quando eu', r'no dia que', r'lembro até hoje', r'o negócio é o seguinte',
+        r'a parada é que', r'vou contar', r'deixa eu explicar', r'importante saber',
+        r'você sabia', r'já ouviu falar', r'vou revelar', r'segredo'
+    ]
+    
+    padroes_meio = [
+        r'e aí', r'então', r'depois', r'quando', r'porque', r'aí ele', r'aí ela',
+        r'só que', r'daí', r'mas', r'porém', r'continuando', r'além disso',
+        r'também', r'outra coisa', r'o mais interessante'
+    ]
+    
+    padroes_fim = [
+        r'entendeu\?', r'sacanagem', r'pois é', r'fim', r'então é isso',
+        r'por isso que', r'acabou', r'foi assim', r'é isso aí', r'acredita\?',
+        r'pode isso\?', r'né não\?', r'então pronto', r'fim da história',
+        r'por causa disso'
+    ]
+    
+    # Verificar padrões base
+    for padrao in padroes_inicio:
+        if re.search(padrao, texto_lower):
+            resultado["inicio"] = True
+            break
+    
+    for padrao in padroes_meio:
+        if re.search(padrao, texto_lower):
+            resultado["meio"] = True
+            break
+    
+    for padrao in padroes_fim:
+        if re.search(padrao, texto_lower):
+            resultado["fim"] = True
+            break
+    
+    # Se tiver learning system, usar padrões aprendidos
+    if learning_system:
+        palavras = texto_lower.split()[:5]
+        for palavra in palavras:
+            # Verificar se palavra é forte indicador de início
+            recomendacoes = learning_system.recomendar_palavras_chave("inicio", threshold=0.6)
+            for rec_palavra, precisao in recomendacoes:
+                if rec_palavra in texto_lower:
+                    resultado["inicio"] = True
+                    break
+    
+    return resultado
+
+
+def identificar_historias_completas(transcription_segments, learning_system=None):
+    """
+    Identifica histórias completas na transcrição.
+    Retorna lista de histórias com início, fim e texto.
+    """
+    historias = []
+    historia_atual = None
+    texto_anterior = ""
+    
+    for i, seg in enumerate(transcription_segments):
+        texto = seg.get("text", "").strip()
+        if not texto:
+            continue
+        
+        # Aplicar correções aprendidas
+        if learning_system:
+            texto = corrigir_transcricao_com_aprendizado(texto, learning_system)
+        
+        estrutura = detectar_estrutura_historia(texto, texto_anterior, learning_system)
+        
+        # Se é início de história
+        if estrutura["inicio"] or (historia_atual is None and len(texto.split()) > 10):
+            # Finalizar história anterior se existir
+            if historia_atual:
+                # Só considerar se tiver tamanho mínimo (10s)
+                if historia_atual["fim"] - historia_atual["inicio"] >= 8:
+                    historias.append(historia_atual)
+            
+            # Começar nova história
+            historia_atual = {
+                "inicio": seg["start"],
+                "fim": seg["end"],
+                "segmentos": [seg],
+                "texto_completo": texto,
+                "confianca": 2.0 if estrutura["inicio"] else 1.0
+            }
+        
+        # Se tem história ativa
+        elif historia_atual:
+            # Adicionar segmento à história atual
+            historia_atual["segmentos"].append(seg)
+            historia_atual["fim"] = seg["end"]
+            historia_atual["texto_completo"] += " " + texto
+            
+            # Se detectou fim de história
+            if estrutura["fim"]:
+                if historia_atual["fim"] - historia_atual["inicio"] >= 8:
+                    historias.append(historia_atual)
+                historia_atual = None
+        
+        texto_anterior = texto
+    
+    # Adicionar última história se existir
+    if historia_atual and (historia_atual["fim"] - historia_atual["inicio"] >= 8):
+        historias.append(historia_atual)
+    
+    return historias
+
+
+# ============================================
+# NOVA FUNÇÃO: Detectar momento mais viral
+# ============================================
+
+def detectar_momento_mais_viral(historias, transcription_segments, viral_intervals):
+    """
+    Detecta o momento mais viral considerando:
+    - Pontuação viral (score)
+    - Palavras de alto impacto
+    - Risadas
+    - Volume alto
+    - Posição no vídeo (primeiros minutos são melhores)
+    """
+    if not historias and not viral_intervals:
+        return None
+    
+    melhor_historia = None
+    melhor_pontuacao = -1
+    
+    # Primeiro, avaliar histórias completas
+    for historia in historias:
+        pontuacao = historia.get("confianca", 1.0) * 2  # Peso base
+        
+        texto = historia["texto_completo"].lower()
+        
+        # Palavras de alto impacto (viral)
+        palavras_virais = [
+            "segredo", "revelação", "chocante", "incrível", "nunca",
+            "descobri", "caramba", "mentira", "impossível", "absurdo",
+            "bizarro", "assustador", "urgente", "atenção", "epstein",
+            "putz", "nossa", "sério", "não acredito", "morri"
+        ]
+        
+        for palavra in palavras_virais:
+            if palavra in texto:
+                pontuacao += 2
+        
+        # Verificar sobreposição com intervalos virais
+        for vi in viral_intervals:
+            if (vi["start"] <= historia["fim"] and vi["end"] >= historia["inicio"]):
+                pontuacao += vi.get("score", 1.0) * 3
+                if vi.get("source") == "laughter":
+                    pontuacao += 3  # Risada é muito viral
+        
+        # Posição no vídeo (primeiros 2 minutos são melhores)
+        if historia["inicio"] < 120:
+            pontuacao += 2
+        elif historia["inicio"] < 300:
+            pontuacao += 1
+        
+        # Duração ideal (21-45s é melhor para viral)
+        duracao = historia["fim"] - historia["inicio"]
+        if 21 <= duracao <= 45:
+            pontuacao += 2
+        elif 46 <= duracao <= 90:
+            pontuacao += 1
+        
+        if pontuacao > melhor_pontuacao:
+            melhor_pontuacao = pontuacao
+            melhor_historia = historia
+    
+    # Se não encontrou nenhuma história boa, usar intervalo viral
+    if melhor_historia is None and viral_intervals:
+        melhor_vi = max(viral_intervals, key=lambda x: x.get("score", 0))
+        melhor_historia = {
+            "inicio": melhor_vi["start"],
+            "fim": melhor_vi["end"],
+            "texto_completo": "Momento viral detectado",
+            "confianca": melhor_vi.get("score", 1.0)
+        }
+    
+    return melhor_historia
+
+
+# ============================================
+# NOVA FUNÇÃO: Criar clipe ajustado para plataforma
+# ============================================
+
+def create_clip_para_plataforma(video_path, historia, output_path, plataforma="tiktok", **kwargs):
+    """
+    Versão da create_clip que ajusta duração conforme plataforma
+    """
+    start_time = historia["inicio"]
+    end_time = historia["fim"]
+    duracao_original = end_time - start_time
+    
+    # Ajustar duração conforme plataforma
+    if plataforma == "tiktok":
+        # TikTok precisa de 60+ segundos para monetização
+        if duracao_original < 60:
+            # Expandir para 65s (um pouco mais que o mínimo)
+            expandir = (65 - duracao_original) / 2
+            novo_inicio = max(0, start_time - expandir)
+            novo_fim = end_time + expandir
+            log(f"📱 TikTok: Expandindo clipe de {duracao_original:.1f}s para {novo_fim-novo_inicio:.1f}s (monetizável)")
+        elif duracao_original > 180:
+            # Muito longo, limitar a 120s
+            novo_inicio = start_time
+            novo_fim = start_time + 120
+        else:
+            novo_inicio = start_time
+            novo_fim = end_time
+        
+    elif plataforma == "youtube_shorts":
+        # YouTube Shorts: 15-60s (ideal 21-45s)
+        if duracao_original > 60:
+            # Encurtar para 55s
+            novo_inicio = start_time
+            novo_fim = start_time + 55
+            log(f"▶️ YouTube Shorts: Encurtando clipe de {duracao_original:.1f}s para 55s")
+        elif duracao_original < 15:
+            # Expandir para 20s
+            expandir = (20 - duracao_original) / 2
+            novo_inicio = max(0, start_time - expandir)
+            novo_fim = end_time + expandir
+        else:
+            novo_inicio = start_time
+            novo_fim = end_time
+    else:
+        novo_inicio = start_time
+        novo_fim = end_time
+    
+    # Criar um novo objeto de clipe com os tempos ajustados
+    clip_ajustado = {
+        "start": f"{int(novo_inicio//60):02d}:{int(novo_inicio%60):02d}",
+        "end": f"{int(novo_fim//60):02d}:{int(novo_fim%60):02d}",
+        "caption": historia.get("texto_completo", "")[:100],
+        "segments": []  # Será preenchido depois
+    }
+    
+    return clip_ajustado
+
+
+def review_transcription(transcription_segments, learning_system=None):
     """Prompt the user to review and optionally correct transcription."""
     log("\n=== Transcription Review ===")
     for i, segment in enumerate(transcription_segments):
         log(f"\nSegment {i+1}/{len(transcription_segments)}")
         log(f"[{segment['start']:.2f} - {segment['end']:.2f}]")
+        
+        # Aplicar correções automáticas primeiro
+        texto_corrigido = corrigir_transcricao(segment['text'])
+        if learning_system:
+            texto_corrigido = corrigir_transcricao_com_aprendizado(texto_corrigido, learning_system)
+        
+        if texto_corrigido != segment['text']:
+            log(f"Original: {segment['text']}")
+            log(f"Corrigido: {texto_corrigido}")
+            segment['text'] = texto_corrigido
+        
         log(f"Current text: {segment['text']}")
         user_input = input("Correction (or enter to accept, q to quit): ")
         if user_input.lower() == 'q':
             break
-        elif user_input:
+        elif user_input and user_input != segment['text']:
+            # Aprender com a correção manual
+            if learning_system:
+                learning_system.aprender_com_correcao(segment['text'], user_input, 
+                                                      f"Segmento {i+1} do vídeo")
             segment['text'] = user_input
+    
     return transcription_segments
 
 
@@ -281,10 +793,10 @@ def detectar_risadas(audio_path: str) -> List[Tuple[float, float]]:
     return laughter_intervals
 
 
-def aplicar_fade_audio(video_path: str, fade_in_duration: float = 1.0, fade_out_duration: float = 1.0) -> str:
+def aplicar_fade_audio(video_path: str, fade_in_duration: float = 0.8, fade_out_duration: float = 0.8) -> str:
     """
     Aplica fade in e fade out no áudio do vídeo.
-    Retorna o caminho do novo vídeo com fade aplicado.
+    Duração recomendada: 0.5 a 1 segundo.
     """
     if not os.path.exists(video_path):
         return video_path
@@ -426,7 +938,7 @@ def detectar_momentos_virais(audio_path: str,
                 "alto impacto": ["segredo", "revelação", "chocante", "incrível", "surpreendente",
                                "nunca", "não vai acreditar", "você não vai acreditar", "descobri", "putz",
                                "caramba", "nossa", "sério", "mentira", "impossível", "absurdo",
-                               "bizarro", "assustador", "perigoso", "urgente", "atenção"],
+                               "bizarro", "assustador", "perigoso", "urgente", "atenção", "epstein"],
                 "engajamento": ["inscreva-se", "comenta", "compartilha", "like", "curte",
                                "deixa o like", "ativa o sininho", "segue", "compartilhe"],
                 "emocional": ["chorei", "ri", "rindo", "emocionante", "triste", "feliz", "raiva",
@@ -438,7 +950,7 @@ def detectar_momentos_virais(audio_path: str,
                 "alto impacto": ["secret", "reveal", "shocking", "incredible", "surprising",
                                "never", "you won't believe", "discovered", "wow", "oh my god",
                                "seriously", "no way", "impossible", "crazy", "insane",
-                               "scary", "dangerous", "urgent", "attention"],
+                               "scary", "dangerous", "urgent", "attention", "epstein"],
                 "engajamento": ["subscribe", "comment", "share", "like", "hit that like",
                                "ring the bell", "follow"],
                 "emocional": ["cried", "laughed", "laughing", "emotional", "sad", "happy", "angry",
@@ -653,7 +1165,7 @@ def rankear_clipes_por_ia(clipes_info: List[Dict[str, Any]]) -> List[Dict[str, A
             # Palavras-chave de alto impacto
             palavras_impacto = clip.get('palavras_chave', [])
             for p in palavras_impacto:
-                if p in ['segredo', 'revelação', 'chocante', 'incrível', 'urgente']:
+                if p in ['segredo', 'revelação', 'chocante', 'incrível', 'urgente', 'epstein']:
                     nota += 0.5
                     break
             
@@ -781,7 +1293,7 @@ def formatar_timestamp_srt(segundos: float) -> str:
     return f"{horas:02d}:{minutos:02d}:{segs:02d},{milissegundos:03d}"
 
 
-# face cascade
+# face cascade (fallback)
 autoPath = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 face_cascade = cv2.CascadeClassifier(autoPath)
 
@@ -832,10 +1344,32 @@ class LLMClipFinder:
         return {"clips": clips}
 
 
+def detectar_mudanca_cena(frame_atual, frame_anterior, threshold=40.0):
+    """
+    Detecta se houve uma mudança brusca de cena (corte/abertura de câmera)
+    Retorna True se houve mudança significativa
+    """
+    if frame_anterior is None:
+        return False
+    
+    # Converter para escala de cinza
+    gray_atual = cv2.cvtColor(frame_atual, cv2.COLOR_BGR2GRAY)
+    gray_anterior = cv2.cvtColor(frame_anterior, cv2.COLOR_BGR2GRAY)
+    
+    # Calcular diferença absoluta
+    diff = cv2.absdiff(gray_atual, gray_anterior)
+    
+    # Calcular média da diferença
+    mean_diff = np.mean(diff)
+    
+    # Se a diferença for muito alta, provavelmente mudou de cena
+    return mean_diff > threshold
+
+
 def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255, 255, 230),
                 highlight_color=(255, 226, 165, 220), text_color=(0, 0, 0), headline_text=None,
                 broll_map=None, remove_silence=True, retranscribe=False, ranking_info=None,
-                fade_duration=1.0):
+                fade_duration=0.8, learning_system=None):
     """Render a single clip with enhanced visuals and clean captions."""
     start_time = parse_timestamp(clip["start"])
     end_time = parse_timestamp(clip["end"])
@@ -901,6 +1435,20 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
         word_timings.append({"text": fallback_text, "start": 0, "end": duration})
         log(f"[debug] inserted fallback caption '{fallback_text}' for clip at {start_time}")
     
+    # Filtrar palavras de interrupção (aham, é, etc)
+    palavras_ignorar = {"aham", "hum", "é", "não", "sim", "entendi", "ok", "beleza", "blz",
+                        "caramba", "putz", "nossa", "verdade", "exato", "também", "tipo", "né",
+                        "certo", "claro", "poxa", "ata", "se liga", "então", "ah", "ó", "ih"}
+    
+    word_timings_filtrados = []
+    for w in word_timings:
+        texto = w["text"].lower().strip(".,?!")
+        if texto in palavras_ignorar or len(texto.split()) <= 2:
+            continue
+        word_timings_filtrados.append(w)
+    
+    word_timings = word_timings_filtrados if word_timings_filtrados else word_timings
+    
     phrase_timings = agrupar_blocos_legendas(word_timings)
     log(f"[debug] word_timings count={len(word_timings)}, phrase_timings count={len(phrase_timings)} for clip starting at {start_time}")
     
@@ -925,7 +1473,7 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
                 })
     
     # ============================================
-    # CSRT TRACKER COM SUAVIZAÇÃO EXTREMA
+    # CSRT TRACKER COM DETECÇÃO DE FALA E MUDANÇA DE CENA
     # ============================================
     
     # CSRT Tracker (mais preciso para rostos)
@@ -942,6 +1490,21 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
     ultimo_x_valido = pos_x
     ultimo_y_valido = pos_y
     ultimo_h_valido = size_h
+    
+    # Para priorizar rosto sobre mãos/objetos
+    ultimo_rosto_valido = None
+    frames_sem_rosto = 0
+    
+    # Para detecção de fala
+    rostos_com_landmarks = []
+    historico_movimento = {}
+    falante_ativo = None
+    frames_sem_fala = 0
+    
+    # Para detecção de mudança de cena
+    frame_anterior = None
+    mudanca_cena_detectada = False
+    frames_desde_mudanca = 0
     
     log(f"Processing {total_frames} frames at {fps} fps (duration {duration:.1f}s)")
     frames_processed = 0
@@ -965,31 +1528,112 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
                 break
         
         # ============================================
-        # CSRT TRACKING
+        # DETECÇÃO DE MUDANÇA DE CENA
         # ============================================
         
-        # Inicializar tracker no primeiro frame ou se perdeu
-        if not tracker_inicializado or missed_face > 30:
-            # Detectar face com Haar Cascade
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.05,
-                minNeighbors=5,
-                minSize=(80, 80)
+        if frame_anterior is not None:
+            mudanca_cena_detectada = detectar_mudanca_cena(frame, frame_anterior, threshold=40.0)
+            if mudanca_cena_detectada:
+                frames_desde_mudanca = 0
+                log(f"[debug] Mudança de cena detectada no frame {frames_processed}")
+                # Forçar redetecção de rosto
+                tracker_inicializado = False
+                missed_face = 30
+        else:
+            mudanca_cena_detectada = False
+        
+        frame_anterior = frame.copy()
+        frames_desde_mudanca += 1
+        
+        # ============================================
+        # DETECÇÃO FACIAL COM MEDIAPIPE
+        # ============================================
+        
+        # Converter BGR para RGB (MediaPipe precisa)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb_frame)
+        
+        rostos_com_landmarks = []
+        
+        if results.multi_face_landmarks:
+            h, w, _ = frame.shape
+            
+            for face_landmarks in results.multi_face_landmarks:
+                # Calcular bounding box a partir dos landmarks
+                xs = [landmark.x * w for landmark in face_landmarks.landmark]
+                ys = [landmark.y * h for landmark in face_landmarks.landmark]
+                
+                x_min = int(min(xs))
+                x_max = int(max(xs))
+                y_min = int(min(ys))
+                y_max = int(max(ys))
+                
+                bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                rostos_com_landmarks.append((bbox, face_landmarks))
+        
+        # ============================================
+        # DETECTAR QUEM ESTÁ FALANDO
+        # ============================================
+        
+        if rostos_com_landmarks:
+            novo_falante = detectar_quem_esta_falando(
+                rostos_com_landmarks, frame, historico_movimento, w, h
             )
             
-            if len(faces) > 0:
-                # Pegar o maior rosto
-                x, y, w, h = max(faces, key=lambda r: r[2]*r[3])
+            if novo_falante is not None:
+                falante_ativo = novo_falante
+                frames_sem_fala = 0
+            else:
+                frames_sem_fala += 1
+                if frames_sem_fala > 30:
+                    falante_ativo = None
+        else:
+            frames_sem_fala += 1
+            if frames_sem_fala > 30:
+                falante_ativo = None
+        
+        # ============================================
+        # SELECIONAR ROSTO PARA TRACKING
+        # ============================================
+        
+        rosto_para_tracking = None
+        
+        if rostos_com_landmarks:
+            if falante_ativo is not None and falante_ativo < len(rostos_com_landmarks):
+                # Priorizar quem está falando
+                rosto_para_tracking = rostos_com_landmarks[falante_ativo]
+            else:
+                # Se não tem falante, escolher rosto mais central
+                centro_tela_x = w / 2
+                melhor_rosto = None
+                menor_distancia = float('inf')
                 
-                # Inicializar tracker CSRT
+                for i, (bbox, _) in enumerate(rostos_com_landmarks):
+                    x, y, w_rosto, h_rosto = bbox
+                    rosto_center_x = x + w_rosto/2
+                    distancia = abs(rosto_center_x - centro_tela_x)
+                    
+                    if distancia < menor_distancia:
+                        menor_distancia = distancia
+                        melhor_rosto = (bbox, _)
+                
+                rosto_para_tracking = melhor_rosto
+        
+        # ============================================
+        # ATUALIZAR TRACKER
+        # ============================================
+        
+        # Inicializar tracker se necessário
+        if not tracker_inicializado or missed_face > 30 or mudanca_cena_detectada:
+            if rosto_para_tracking is not None:
+                bbox, landmarks = rosto_para_tracking
+                x, y, w, h = bbox
+                
                 tracker = cv2.TrackerCSRT_create()
                 tracker.init(frame, (x, y, w, h))
                 tracker_inicializado = True
                 missed_face = 0
                 
-                # Posição inicial
                 cx = x + w/2
                 cy = y + h/2
                 ultimo_x_valido = cx
@@ -997,12 +1641,7 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
                 ultimo_h_valido = h
                 
                 if frames_processed % 500 == 0:
-                    log(f"[debug] CSRT tracker inicializado em ({cx:.1f},{cy:.1f})")
-            else:
-                # Sem face detectada
-                cx = ultimo_x_valido
-                cy = ultimo_y_valido
-                h = ultimo_h_valido
+                    log(f"[debug] Tracker inicializado com rosto {'falante' if falante_ativo is not None else 'central'}")
         
         # Usar tracker se inicializado
         if tracker_inicializado and tracker is not None:
@@ -1012,62 +1651,60 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
                 missed_face = 0
                 x, y, w, h = [int(v) for v in bbox]
                 
-                # Verificar se o tracker não encolheu demais
                 if w > 30 and h > 30:
                     cx = x + w/2
                     cy = y + h/2
                     
-                    # TRAVA DE POSIÇÃO - limitar movimento brusco
+                    # TRAVA DE POSIÇÃO
                     dx = abs(cx - ultimo_x_valido)
                     dy = abs(cy - ultimo_y_valido)
                     
                     if dx > 40 or dy > 40:
-                        # Movimento muito brusco! Usar posição anterior
                         if frames_processed % 100 == 0:
                             log(f"[debug] Trava ativada! Movimento: ({dx:.1f},{dy:.1f})")
                         cx = ultimo_x_valido
                         cy = ultimo_y_valido
                         h = ultimo_h_valido
                     else:
-                        # Movimento normal, atualizar
                         ultimo_x_valido = cx
                         ultimo_y_valido = cy
                         ultimo_h_valido = h
                 else:
-                    # Tracker encolheu, usar posição anterior
                     cx = ultimo_x_valido
                     cy = ultimo_y_valido
                     h = ultimo_h_valido
             else:
-                # Tracker perdeu o rosto
                 missed_face += 1
+                if learning_system and missed_face == 10:
+                    learning_system.registrar_erro_tracker()
+                
                 cx = ultimo_x_valido
                 cy = ultimo_y_valido
                 h = ultimo_h_valido
                 
                 if missed_face > 30:
                     tracker_inicializado = False
-                    if frames_processed % 500 == 0:
-                        log(f"[debug] Tracker perdeu rosto, reinicalizando...")
         else:
-            # Tracker não inicializado, usar última posição conhecida
-            cx = ultimo_x_valido
-            cy = ultimo_y_valido
-            h = ultimo_h_valido
+            if rosto_para_tracking is not None:
+                bbox, _ = rosto_para_tracking
+                x, y, w, h = bbox
+                cx = x + w/2
+                cy = y + h/2
+            else:
+                cx = ultimo_x_valido
+                cy = ultimo_y_valido
+                h = ultimo_h_valido
         
         # ============================================
-        # SUAVIZAÇÃO EXPONENCIAL FINAL
+        # SUAVIZAÇÃO FINAL
         # ============================================
         
-        # Aplicar suavização exponencial (ultra suave)
         pos_x = pos_x * alpha + cx * (1 - alpha)
         pos_y = pos_y * alpha + cy * (1 - alpha)
         size_h = size_h * alpha + h * (1 - alpha)
         
-        # Guardar posição suavizada
         face_positions.append((pos_x, pos_y, size_h))
         
-        # Usar posição suavizada
         avg_cx = pos_x
         avg_cy = pos_y
         avg_h = size_h
@@ -1076,7 +1713,6 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
         # COMPOSIÇÃO DO FRAME
         # ============================================
         
-        # compose frame: blurred background and optional face-centering
         scale_bg = max(target_width/orig_width, target_height/orig_height)
         new_w = int(orig_width * scale_bg)
         new_h = int(orig_height * scale_bg)
@@ -1084,6 +1720,8 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
         x_off_bg = (new_w - target_width) // 2
         y_off_bg = (new_h - target_height) // 2
         background = resized_bg[y_off_bg:y_off_bg+target_height, x_off_bg:x_off_bg+target_width]
+        
+        # Aplicar desfoque no fundo
         background = cv2.GaussianBlur(background, (51, 51), 0)
         result = background.copy()
 
@@ -1114,11 +1752,10 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
                 crop_w = orig_width
                 crop_h = int(crop_w / target_ratio)
 
-            offset_y = int(crop_h * 0.2)
+            offset_y = int(crop_h * 0.15)
             cx = int(avg_cx)
             cy = int(avg_cy) - offset_y
             
-            # Limitar para não sair do frame
             x1 = max(0, min(orig_width - crop_w, cx - crop_w // 2))
             y1 = max(0, min(orig_height - crop_h, cy - crop_h // 2))
             
@@ -1215,7 +1852,6 @@ def create_clip(video_path, clip, output_path, captions=True, bg_color=(255, 255
         final_com_ranking = final_output.replace('.mp4', '_classificado.mp4')
         adicionar_ranking_ao_video(final_output, ranking_info, final_com_ranking)
         
-        # Substituir pelo vídeo com ranking
         if os.path.exists(final_com_ranking):
             os.remove(final_output)
             os.rename(final_com_ranking, final_output)
@@ -1236,14 +1872,12 @@ def criar_estrutura_clipes(videos_gerados: List[str], textos: List[str], base_di
     os.makedirs(clipes_root, exist_ok=True)
     
     for idx, (vid, txt) in enumerate(zip(videos_gerados, textos), start=1):
-        # Encontrar ranking para este clipe
         ranking_info = {}
         if rankings and idx - 1 < len(rankings):
             ranking_info = rankings[idx - 1]
         
         title, tags = sugerir_titulo_e_hashtags(txt)
         
-        # Adicionar nota ao título se disponível
         if ranking_info and 'nota_ia' in ranking_info:
             estrelas = '★' * int(ranking_info['nota_ia'] / 2) + '☆' * (5 - int(ranking_info['nota_ia'] / 2))
             title = f"[{ranking_info['nota_ia']}/10 {estrelas}] {title}"
@@ -1267,7 +1901,6 @@ def criar_estrutura_clipes(videos_gerados: List[str], textos: List[str], base_di
         with open(os.path.join(folder, "hashtags.txt"), "w", encoding="utf-8") as f:
             f.write(" ".join(tags))
         
-        # Salvar ranking se disponível
         if ranking_info:
             with open(os.path.join(folder, "ranking.json"), "w", encoding="utf-8") as f:
                 json.dump(ranking_info, f, indent=2, ensure_ascii=False)
@@ -1307,7 +1940,10 @@ def main():
     parser.add_argument("--broll-dir", help="Directory containing keyword images for b-roll overlays")
     parser.add_argument("--rank-clips", action="store_true", help="Rank clips using AI (nota de 0-10)")
     parser.add_argument("--no-ranking-overlay", action="store_true", help="Don't add ranking overlay to videos")
-    parser.add_argument("--fade-duration", type=float, default=1.0, help="Fade in/out duration in seconds (default: 1.0)")
+    parser.add_argument("--fade-duration", type=float, default=0.8, help="Fade in/out duration in seconds (default: 0.8)")
+    parser.add_argument("--learn", action="store_true", help="Enable continuous learning from corrections")
+    parser.add_argument("--platform", type=str, default="ambas", choices=["tiktok", "shorts", "ambas"],
+                        help="Plataforma alvo: tiktok, shorts, ou ambas")
     
     args = parser.parse_args()
     
@@ -1323,6 +1959,12 @@ def main():
             key = os.path.splitext(fname)[0].lower()
             broll_map[key] = os.path.join(args.broll_dir, fname)
     
+    # Inicializar sistema de aprendizado
+    learning_system = None
+    if args.learn:
+        learning_system = ContinuousLearningSystem()
+        log("Sistema de aprendizado contínuo ativado!")
+    
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs("temp", exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "transcricoes"), exist_ok=True)
@@ -1332,13 +1974,11 @@ def main():
     
     log_path = os.path.join(logs_dir, "processamento.log")
     
-    # configure global logger path
     global LOG_PATH
     LOG_PATH = log_path
     
     log(f"Log started at {time.asctime()}")
     
-    # Verificar se arquivo de vídeo existe
     if not os.path.exists(args.video_path):
         log(f"ERRO: Arquivo de vídeo não encontrado: {args.video_path}")
         return
@@ -1349,172 +1989,52 @@ def main():
     transcription_segments = transcribe_audio(audio_path, args.whisper_model)
     
     if not args.no_review:
-        transcription_segments = review_transcription(transcription_segments)
+        transcription_segments = review_transcription(transcription_segments, learning_system)
     
-    txt_path = os.path.join(args.output_dir, "transcricoes", "completa.txt")
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(seg.get("text","") for seg in transcription_segments))
+    # Identificar histórias completas
+    historias = identificar_historias_completas(transcription_segments, learning_system)
+    log(f"\n=== {len(historias)} HISTÓRIAS COMPLETAS DETECTADAS ===")
+    for i, historia in enumerate(historias[:5]):  # Mostrar primeiras 5
+        log(f"História {i+1}: {historia['inicio']:.1f}s - {historia['fim']:.1f}s")
+        log(f"  {historia['texto_completo'][:100]}...")
     
-    with open(os.path.join(args.output_dir, "transcricoes", "segmentos.json"), "w", encoding="utf-8") as f:
-        json.dump(transcription_segments, f, indent=2)
-    
-    clip_finder = LLMClipFinder(api_key=args.api_key)
-    clip_suggestions = clip_finder.find_interesting_moments(transcription_segments, args.min_clips, args.max_clips)
-    log(f"Initial clip suggestions: {clip_suggestions}")
-    
+    # Detectar momentos virais
     viral_intervals = detectar_momentos_virais(audio_path, transcription_segments)
     
-    if viral_intervals:
-        log(f"[debug] viral intervals detected: {viral_intervals}")
-        if not clip_suggestions or "clips" not in clip_suggestions:
-            clip_suggestions = {"clips": []}
-        
-        for vi in viral_intervals:
-            clip_suggestions.setdefault("clips", []).append({
-                "start": f"{int(vi['start']//60):02d}:{int(vi['start']%60):02d}",
-                "end": f"{int(vi['end']//60):02d}:{int(vi['end']%60):02d}",
-                "reason": vi.get("keyword","viral moment"),
-                "viral_score": vi.get("score", 1.0),
-                "viral_source": vi.get("source", "audio")
-            })
-    
-    if not clip_suggestions or "clips" not in clip_suggestions or not clip_suggestions["clips"]:
-        log("No clip suggestions obtained; falling back to uniform segmentation")
-        clip_suggestions = {"clips": []}
-        total_dur = transcription_segments[-1].get("end", 0) if transcription_segments else 0
-        for i in range(args.min_clips):
-            s = min(i * 30, max(0, total_dur - 15))
-            e = min(s + 30, total_dur)
-            clip_suggestions["clips"].append({
-                "start": f"{int(s//60):02d}:{int(s%60):02d}",
-                "end": f"{int(e//60):02d}:{int(e%60):02d}",
-                "reason": "fallback",
-                "viral_score": 0.5
-            })
-    
-    # enforce at least one hook early
-    if clip_suggestions.get("clips"):
-        if all(parse_timestamp(c["start"]) > 3 for c in clip_suggestions["clips"]):
-            log("adding early hook clip")
-            clip_suggestions["clips"].insert(0,{
-                "start":"00:00",
-                "end":"00:15",
-                "reason":"hook",
-                "viral_score": 1.0
-            })
-    
-    # clamp durations to 15-45s
-    for c in clip_suggestions.get("clips",[]):
-        s = parse_timestamp(c["start"])
-        e = parse_timestamp(c["end"])
-        if e - s < 15:
-            e = s + 15
-        if e - s > 45:
-            e = s + 45
-        c["start"] = f"{int(s//60):02d}:{int(s%60):02d}"
-        c["end"] = f"{int(e//60):02d}:{int(e%60):02d}"
+    # NOVA PARTE: Detectar momento mais viral
+    momento_viral = detectar_momento_mais_viral(historias, transcription_segments, viral_intervals)
     
     created_clips = []
     clip_texts = []
-    clipes_info_para_ranking = []
     
-    for i, clip in enumerate(clip_suggestions["clips"]):
-        start = clip.get("start")
-        end = clip.get("end")
-        caption = clip.get("caption", "")
+    # Se detectou momento viral, criar clipes específicos para as plataformas
+    if momento_viral and args.platform in ["tiktok", "ambas"]:
+        log(f"\n🔥 MOMENTO MAIS VIRAL DETECTADO:")
+        log(f"   Início: {momento_viral['inicio']:.1f}s")
+        log(f"   Fim: {momento_viral['fim']:.1f}s")
+        log(f"   Duração: {momento_viral['fim'] - momento_viral['inicio']:.1f}s")
         
-        clip_obj = {"start": start, "end": end, "caption": caption, "segments": []}
-        
-        # collect word segments overlapping
-        for seg in transcription_segments:
-            if seg['end'] >= parse_timestamp(start) and seg['start'] <= parse_timestamp(end):
-                import copy
-                clip_obj["segments"].append(copy.deepcopy(seg))
-        
-        # Extrair texto completo do clipe
-        clip_texto = " ".join([seg.get("text","") for seg in clip_obj.get("segments", [])])
-        clip_texts.append(clip_texto)
-        
-        # Coletar informações para ranking
-        clip_info = {
-            "id": i + 1,
-            "start": start,
-            "end": end,
-            "start_time": parse_timestamp(start),
-            "end_time": parse_timestamp(end),
-            "duracao": parse_timestamp(end) - parse_timestamp(start),
-            "texto": clip_texto,
-            "palavras_chave": [kw for kw in clip_texto.lower().split() if len(kw) > 3][:10],
-            "viral_score": clip.get("viral_score", 0.5),
-            "viral_source": clip.get("viral_source", "unknown"),
-            "tem_risada": False,
-            "tem_pergunta": any(p in clip_texto for p in ['?', 'como', 'quando', 'onde', 'por que'])
-        }
-        
-        # Verificar se tem risada no intervalo
-        for vi in viral_intervals:
-            if vi.get("source") == "laughter":
-                vi_start = vi.get("start", 0)
-                vi_end = vi.get("end", 0)
-                if (vi_start <= clip_info["end_time"] and vi_end >= clip_info["start_time"]):
-                    clip_info["tem_risada"] = True
-                    clip_info["viral_score"] = max(clip_info["viral_score"], vi.get("score", 2.5))
-                    break
-        
-        clipes_info_para_ranking.append(clip_info)
-    
-    # RANKING DOS CLIPES POR IA
-    if args.rank_clips:
-        log("\n" + "="*50)
-        log("GERANDO RANKING DOS CLIPES POR IA")
-        log("="*50)
-        
-        clipes_ordenados = rankear_clipes_por_ia(clipes_info_para_ranking)
-        
-        # Mostrar ranking completo
-        log("\n" + "="*50)
-        log("RANKING FINAL DOS CLIPES:")
-        log("="*50)
-        for clip in clipes_ordenados:
-            estrelas = '★' * int(clip.get('nota_ia', 0) / 2) + '☆' * (5 - int(clip.get('nota_ia', 0) / 2))
-            log(f"#{clip['ranking']} - Clip {clip['id']} | NOTA: {clip['nota_ia']}/10 {estrelas}")
-            log(f"   Texto: {clip['texto'][:100]}...")
-            if clip.get('justificativa_ia'):
-                log(f"   Justificativa: {clip['justificativa_ia']}")
-            log("")
-        
-        # Salvar ranking em arquivo
-        ranking_path = os.path.join(args.output_dir, "ranking_clipes.json")
-        with open(ranking_path, "w", encoding="utf-8") as f:
-            json.dump(clipes_ordenados, f, indent=2, ensure_ascii=False)
-        log(f"Ranking salvo em: {ranking_path}")
-    
-    # CRIAR CLIPS (na ordem original, não na ordem do ranking)
-    for i, clip in enumerate(clip_suggestions["clips"]):
-        clip_obj = {"start": clip["start"], "end": clip["end"], "caption": clip.get("caption", ""), "segments": []}
-        
-        # Re-coletar segments (já que perdemos referência)
-        for seg in transcription_segments:
-            if seg['end'] >= parse_timestamp(clip["start"]) and seg['start'] <= parse_timestamp(clip["end"]):
-                import copy
-                clip_obj["segments"].append(copy.deepcopy(seg))
-        
-        # Encontrar ranking para este clipe (se disponível)
-        ranking_info = None
-        if args.rank_clips and clipes_ordenados:
-            for rc in clipes_ordenados:
-                if rc['id'] == i + 1:
-                    ranking_info = rc
-                    break
-        
-        output_path = os.path.join(args.output_dir, f"clip_{i+1}")
-        
-        add_ranking_overlay = args.rank_clips and not args.no_ranking_overlay
-        
-        clip_path = create_clip(
+        # Criar clipe para TikTok
+        log("\n📱 Criando clipe para TIKTOK (60s+ monetizável)...")
+        clip_tiktok = create_clip_para_plataforma(
             args.video_path,
-            clip_obj,
-            output_path,
+            momento_viral,
+            os.path.join(args.output_dir, "tiktok_viral"),
+            plataforma="tiktok"
+        )
+        
+        # Preencher segments para o clipe do TikTok
+        clip_tiktok["segments"] = []
+        for seg in transcription_segments:
+            if seg['end'] >= parse_timestamp(clip_tiktok["start"]) and seg['start'] <= parse_timestamp(clip_tiktok["end"]):
+                import copy
+                clip_tiktok["segments"].append(copy.deepcopy(seg))
+        
+        # Criar clipe TikTok
+        clip_path_tiktok = create_clip(
+            args.video_path,
+            clip_tiktok,
+            os.path.join(args.output_dir, "tiktok_viral"),
             captions=args.captions,
             bg_color=bg_color,
             highlight_color=highlight_color,
@@ -1523,18 +2043,240 @@ def main():
             broll_map=broll_map,
             remove_silence=True,
             retranscribe=args.retranscribe,
-            ranking_info=ranking_info if add_ranking_overlay else None,
-            fade_duration=args.fade_duration
+            ranking_info=None,
+            fade_duration=args.fade_duration,
+            learning_system=learning_system
         )
         
-        if clip_path:
-            created_clips.append(clip_path)
-            log(f"Successfully created clip at {clip_path}")
+        if clip_path_tiktok:
+            created_clips.append(clip_path_tiktok)
+            clip_texts.append(momento_viral.get("texto_completo", ""))
+            log(f"✅ Clipe TikTok criado: {clip_path_tiktok}")
+    
+    if momento_viral and args.platform in ["shorts", "ambas"]:
+        # Criar clipe para YouTube Shorts
+        log("\n▶️ Criando clipe para YOUTUBE SHORTS...")
+        clip_shorts = create_clip_para_plataforma(
+            args.video_path,
+            momento_viral,
+            os.path.join(args.output_dir, "youtube_shorts_viral"),
+            plataforma="youtube_shorts"
+        )
+        
+        # Preencher segments para o clipe do YouTube Shorts
+        clip_shorts["segments"] = []
+        for seg in transcription_segments:
+            if seg['end'] >= parse_timestamp(clip_shorts["start"]) and seg['start'] <= parse_timestamp(clip_shorts["end"]):
+                import copy
+                clip_shorts["segments"].append(copy.deepcopy(seg))
+        
+        # Criar clipe YouTube Shorts
+        clip_path_shorts = create_clip(
+            args.video_path,
+            clip_shorts,
+            os.path.join(args.output_dir, "youtube_shorts_viral"),
+            captions=args.captions,
+            bg_color=bg_color,
+            highlight_color=highlight_color,
+            text_color=text_color,
+            headline_text=headline,
+            broll_map=broll_map,
+            remove_silence=True,
+            retranscribe=args.retranscribe,
+            ranking_info=None,
+            fade_duration=args.fade_duration,
+            learning_system=learning_system
+        )
+        
+        if clip_path_shorts:
+            created_clips.append(clip_path_shorts)
+            if len(clip_texts) < 2:  # Se já tem TikTok, adicionar outro
+                clip_texts.append(momento_viral.get("texto_completo", ""))
+            log(f"✅ Clipe YouTube Shorts criado: {clip_path_shorts}")
+    
+    # Se não criou clipes específicos ou quer também os clipes normais, continuar com o código original
+    if len(created_clips) == 0 or args.min_clips > 0:
+        # Usar histórias como base para clipes
+        if historias:
+            clip_suggestions = {"clips": []}
+            for historia in historias[:args.max_clips]:
+                clip_suggestions["clips"].append({
+                    "start": f"{int(historia['inicio']//60):02d}:{int(historia['inicio']%60):02d}",
+                    "end": f"{int(historia['fim']//60):02d}:{int(historia['fim']%60):02d}",
+                    "reason": "historia_completa",
+                    "viral_score": historia.get("confianca", 1.0)
+                })
         else:
-            log(f"Failed to create clip {i+1}")
+            # Fallback para o método antigo se não detectar histórias
+            clip_finder = LLMClipFinder(api_key=args.api_key)
+            clip_suggestions = clip_finder.find_interesting_moments(transcription_segments, args.min_clips, args.max_clips)
+        
+        log(f"Initial clip suggestions: {clip_suggestions}")
+        
+        if viral_intervals:
+            log(f"[debug] viral intervals detected: {viral_intervals}")
+            if not clip_suggestions or "clips" not in clip_suggestions:
+                clip_suggestions = {"clips": []}
+            
+            for vi in viral_intervals:
+                clip_suggestions.setdefault("clips", []).append({
+                    "start": f"{int(vi['start']//60):02d}:{int(vi['start']%60):02d}",
+                    "end": f"{int(vi['end']//60):02d}:{int(vi['end']%60):02d}",
+                    "reason": vi.get("keyword","viral moment"),
+                    "viral_score": vi.get("score", 1.0),
+                    "viral_source": vi.get("source", "audio")
+                })
+        
+        if not clip_suggestions or "clips" not in clip_suggestions or not clip_suggestions["clips"]:
+            log("No clip suggestions obtained; falling back to uniform segmentation")
+            clip_suggestions = {"clips": []}
+            total_dur = transcription_segments[-1].get("end", 0) if transcription_segments else 0
+            for i in range(args.min_clips):
+                s = min(i * 30, max(0, total_dur - 15))
+                e = min(s + 30, total_dur)
+                clip_suggestions["clips"].append({
+                    "start": f"{int(s//60):02d}:{int(s%60):02d}",
+                    "end": f"{int(e//60):02d}:{int(e%60):02d}",
+                    "reason": "fallback",
+                    "viral_score": 0.5
+                })
+        
+        # enforce at least one hook early
+        if clip_suggestions.get("clips"):
+            if all(parse_timestamp(c["start"]) > 3 for c in clip_suggestions["clips"]):
+                log("adding early hook clip")
+                clip_suggestions["clips"].insert(0,{
+                    "start":"00:00",
+                    "end":"00:15",
+                    "reason":"hook",
+                    "viral_score": 1.0
+                })
+        
+        clipes_info_para_ranking = []
+        clip_indices = []
+        
+        for i, clip in enumerate(clip_suggestions["clips"]):
+            start = clip.get("start")
+            end = clip.get("end")
+            caption = clip.get("caption", "")
+            
+            clip_obj = {"start": start, "end": end, "caption": caption, "segments": []}
+            
+            for seg in transcription_segments:
+                if seg['end'] >= parse_timestamp(start) and seg['start'] <= parse_timestamp(end):
+                    import copy
+                    clip_obj["segments"].append(copy.deepcopy(seg))
+            
+            clip_texto = " ".join([seg.get("text","") for seg in clip_obj.get("segments", [])])
+            
+            # Evitar duplicar clipes que já foram criados
+            clip_info = {
+                "id": i + 1 + len(created_clips),
+                "start": start,
+                "end": end,
+                "start_time": parse_timestamp(start),
+                "end_time": parse_timestamp(end),
+                "duracao": parse_timestamp(end) - parse_timestamp(start),
+                "texto": clip_texto,
+                "palavras_chave": [kw for kw in clip_texto.lower().split() if len(kw) > 3][:10],
+                "viral_score": clip.get("viral_score", 0.5),
+                "viral_source": clip.get("viral_source", "unknown"),
+                "tem_risada": False,
+                "tem_pergunta": any(p in clip_texto for p in ['?', 'como', 'quando', 'onde', 'por que'])
+            }
+            
+            for vi in viral_intervals:
+                if vi.get("source") == "laughter":
+                    vi_start = vi.get("start", 0)
+                    vi_end = vi.get("end", 0)
+                    if (vi_start <= clip_info["end_time"] and vi_end >= clip_info["start_time"]):
+                        clip_info["tem_risada"] = True
+                        clip_info["viral_score"] = max(clip_info["viral_score"], vi.get("score", 2.5))
+                        break
+            
+            clipes_info_para_ranking.append(clip_info)
+            clip_indices.append(i)
+        
+        # RANKING DOS CLIPES POR IA
+        if args.rank_clips:
+            log("\n" + "="*50)
+            log("GERANDO RANKING DOS CLIPES POR IA")
+            log("="*50)
+            
+            clipes_ordenados = rankear_clipes_por_ia(clipes_info_para_ranking)
+            
+            log("\n" + "="*50)
+            log("RANKING FINAL DOS CLIPES:")
+            log("="*50)
+            for clip in clipes_ordenados:
+                estrelas = '★' * int(clip.get('nota_ia', 0) / 2) + '☆' * (5 - int(clip.get('nota_ia', 0) / 2))
+                log(f"#{clip['ranking']} - Clip {clip['id']} | NOTA: {clip['nota_ia']}/10 {estrelas}")
+                log(f"   Texto: {clip['texto'][:100]}...")
+                if clip.get('justificativa_ia'):
+                    log(f"   Justificativa: {clip['justificativa_ia']}")
+                log("")
+            
+            ranking_path = os.path.join(args.output_dir, "ranking_clipes.json")
+            with open(ranking_path, "w", encoding="utf-8") as f:
+                json.dump(clipes_ordenados, f, indent=2, ensure_ascii=False)
+            log(f"Ranking salvo em: {ranking_path}")
+        
+        # CRIAR CLIPS
+        for idx, i in enumerate(clip_indices):
+            clip = clip_suggestions["clips"][i]
+            clip_obj = {"start": clip["start"], "end": clip["end"], "caption": clip.get("caption", ""), "segments": []}
+            
+            for seg in transcription_segments:
+                if seg['end'] >= parse_timestamp(clip["start"]) and seg['start'] <= parse_timestamp(clip["end"]):
+                    import copy
+                    clip_obj["segments"].append(copy.deepcopy(seg))
+            
+            ranking_info = None
+            if args.rank_clips and clipes_ordenados:
+                for rc in clipes_ordenados:
+                    if rc['id'] == idx + 1 + len(created_clips):
+                        ranking_info = rc
+                        break
+            
+            output_path = os.path.join(args.output_dir, f"clip_{i+1+len(created_clips)}")
+            
+            add_ranking_overlay = args.rank_clips and not args.no_ranking_overlay
+            
+            # Verificar se este clipe é uma história completa
+            historia_completa = False
+            for historia in historias:
+                if abs(historia["inicio"] - parse_timestamp(clip["start"])) < 2 and \
+                   abs(historia["fim"] - parse_timestamp(clip["end"])) < 2:
+                    historia_completa = True
+                    break
+            
+            clip_path = create_clip(
+                args.video_path,
+                clip_obj,
+                output_path,
+                captions=args.captions,
+                bg_color=bg_color,
+                highlight_color=highlight_color,
+                text_color=text_color,
+                headline_text=headline,
+                broll_map=broll_map,
+                remove_silence=True,
+                retranscribe=args.retranscribe,
+                ranking_info=ranking_info if add_ranking_overlay else None,
+                fade_duration=args.fade_duration,
+                learning_system=learning_system
+            )
+            
+            if clip_path:
+                created_clips.append(clip_path)
+                clip_texts.append(clip_obj.get("texto_completo", ""))
+                if learning_system:
+                    learning_system.registrar_clipe_gerado(historia_completa)
+                log(f"Successfully created clip at {clip_path}")
+            else:
+                log(f"Failed to create clip {i+1}")
     
     if created_clips:
-        # Usar clipes ordenados para estrutura se disponível
         rankings_para_estrutura = clipes_ordenados if args.rank_clips else None
         criar_estrutura_clipes(created_clips, clip_texts, base_dir=args.output_dir, rankings=rankings_para_estrutura)
     
